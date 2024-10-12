@@ -1,0 +1,143 @@
+import re
+import json
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+
+@dataclass
+class Page:
+    content: str
+    number: int
+
+@dataclass
+class Document:
+    pages: List[Page]
+
+@dataclass
+class ExtractedData:
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[str] = None
+    customer_number: Optional[str] = None
+    total_amount: Optional[float] = None
+    line_items: List[Dict[str, Any]] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+class ComplexInvoiceExtractor:
+    def __init__(self, template_path: str):
+        with open(template_path, 'r') as f:
+            self.template = json.load(f)
+        self.compiled_patterns = self.compile_regex_patterns(self.template)
+
+    def compile_regex_patterns(self, template: Dict) -> Dict:
+        compiled_patterns = {}
+        for key, value in template.items():
+            if isinstance(value, dict) and 'pattern' in value:
+                flags = value.get('flags', 0)
+                compiled_patterns[key] = re.compile(value['pattern'], flags)
+            elif isinstance(value, dict):
+                compiled_patterns[key] = self.compile_regex_patterns(value)
+        return compiled_patterns
+
+    def extract_data(self, document: Document) -> ExtractedData:
+        extracted_data = ExtractedData()
+        full_text = '\n'.join(page.content for page in document.pages)
+
+        # Extract header information
+        self.extract_header_info(full_text, extracted_data)
+
+        # Extract line items
+        self.extract_line_items(document, extracted_data)
+
+        return extracted_data
+
+    def extract_header_info(self, text: str, data: ExtractedData):
+        for field in ['invoice_number', 'invoice_date', 'customer_number', 'total_amount']:
+            pattern = self.compiled_patterns['header'][field]
+            match = pattern.search(text)
+            if match:
+                value = match.group(1)
+                if field == 'total_amount':
+                    try:
+                        value = float(value.replace(',', ''))
+                    except ValueError:
+                        data.errors.append(f"Could not convert total amount '{value}' to float")
+                        value = None
+                setattr(data, field, value)
+            else:
+                data.errors.append(f"Could not find {field.replace('_', ' ')}")
+
+    def extract_line_items(self, document: Document, data: ExtractedData):
+        table_start_pattern = self.compiled_patterns['line_items']['start']
+        table_end_pattern = self.compiled_patterns['line_items']['end']
+        row_pattern = self.compiled_patterns['line_items']['row']
+
+        table_content = ""
+        table_started = False
+
+        for page in document.pages:
+            if not table_started:
+                start_match = table_start_pattern.search(page.content)
+                if start_match:
+                    table_started = True
+                    table_content += page.content[start_match.end():]
+            else:
+                table_content += page.content
+
+            if table_started:
+                end_match = table_end_pattern.search(table_content)
+                if end_match:
+                    table_content = table_content[:end_match.start()]
+                    break
+
+        if not table_started:
+            data.errors.append("Could not find the start of the line items table")
+            return
+
+        # Processing multi-line rows
+        rows = self.process_multiline_rows(table_content)
+
+        for row in rows:
+            match = row_pattern.match(row)
+            if match:
+                item = {
+                    'description': match.group('description').strip(),
+                    'quantity': int(match.group('quantity')),
+                    'unit_price': float(match.group('unit_price').replace(',', '')),
+                    'total': float(match.group('total').replace(',', ''))
+                }
+                data.line_items.append(item)
+            else:
+                data.errors.append(f"Could not parse line item: {row}")
+
+    def process_multiline_rows(self, table_content: str) -> List[str]:
+        lines = table_content.split('\n')
+        rows = []
+        current_row = ""
+        for line in lines:
+            if re.match(r'\s*\d+', line):  # New row starts with a number
+                if current_row:
+                    rows.append(current_row)
+                current_row = line
+            else:
+                current_row += " " + line.strip()
+        if current_row:
+            rows.append(current_row)
+        return rows
+
+def main():
+    # Example usage
+    extractor = ComplexInvoiceExtractor('optimized_invoice_template.json')
+    
+    # Simulating a multi-page document
+    document = Document([
+        Page("Invoice No: INV-12345\nDate: 15/03/2024\nCustomer: ACME Corp\n", 1),
+        Page("Line Items:\n1. Product A   10   $50.00   $500.00\n2. Product B with a very long description\n   that spans multiple lines\n   5   $100.00   $500.00\n", 2),
+        Page("3. Product C   1   $250.00   $250.00\n\nTotal Amount: $1,250.00", 3)
+    ])
+
+    extracted_data = extractor.extract_data(document)
+
+    print("Extracted Data:")
+    print(json.dumps(extracted_data.__dict__, indent=2, default=str))
+
+if __name__ == "__main__":
+    main()
